@@ -1,0 +1,218 @@
+name: Register Tencent Cloud Accounts
+
+on:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: "并发 job 数量(每个 job 注册 10 个账号)"
+        required: true
+        default: "1"
+        type: choice
+        options:
+          - "1"
+          - "2"
+          - "3"
+          - "4"
+          - "5"
+          - "6"
+          - "7"
+          - "200"
+
+      upstream:
+        description: "上传上游地址(host:port), 如 198.44.182.213:8081(留空则用仓库 Secret/Variable UPSTREAM_API)"
+        required: false
+        type: string
+      upstream_token:
+        description: "上传 Bearer token(留空则用仓库 Secret/Variable UPSTREAM_TOKEN)"
+        required: false
+        type: string
+      count:
+        description: "每个 worker 注册账号数"
+        required: true
+        default: "1"
+        type: string
+      workers:
+        description: "每个 job 的并发进程数"
+        required: true
+        default: "1"
+        type: string
+      key_mode:
+        description: "是否在注册后创建 EdgeOne Makers API Key"
+        required: true
+        default: "skip"
+        type: choice
+        options:
+          - "skip"
+          - "create"
+permissions:
+  contents: read
+
+concurrency:
+  group: txtestreg-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  PYTHONIOENCODING: utf-8
+  MAIL_API: "https://mail.twcdk.com"
+
+jobs:
+  prep:
+    name: Prepare matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.gen.outputs.matrix }}
+    steps:
+      - name: Build job index list
+        id: gen
+        shell: bash
+        run: |
+          n=${{ inputs.jobs }}
+          arr=$(seq 1 "$n" | jq -R -s -c 'split("\n") | map(select(length>0)) | map(tonumber)')
+          echo "matrix=$arr" >> "$GITHUB_OUTPUT"
+          echo "jobs to run: $arr"
+
+  register:
+    name: "register batch ${{ matrix.idx }}"
+    runs-on: windows-latest
+    needs: prep
+    timeout-minutes: 120
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        idx: ${{ fromJSON(needs.prep.outputs.matrix) }}
+
+    steps:
+      - name: Mask upstream secrets
+        shell: bash
+        run: |
+          echo "::add-mask::${{ inputs.upstream_token }}"
+          echo "::add-mask::${{ inputs.upstream }}"
+          echo "::add-mask::${{ vars.UPSTREAM_TOKEN }}"
+          echo "::add-mask::${{ vars.UPSTREAM_API }}"
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+          cache-dependency-path: requirements.txt
+
+      - name: Install deps
+        shell: pwsh
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install cloakbrowser (fresh, no cache)
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:USERPROFILE ".cloakbrowser"
+          if (Test-Path $root) { Remove-Item $root -Recurse -Force }
+          python -m cloakbrowser install
+
+      - name: Resolve & smoke-test cloak chrome
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:USERPROFILE ".cloakbrowser"
+          if (-not (Test-Path $root)) { throw "cloak dir missing: $root" }
+          $c = Get-ChildItem $root -Recurse -Filter chrome.exe -ErrorAction SilentlyContinue |
+               Sort-Object FullName | Select-Object -Last 1
+          if (-not $c) {
+            Write-Host "=== .cloakbrowser 内容 ==="
+            Get-ChildItem $root -Recurse -Depth 2 | Select-Object -First 30 FullName
+            throw "cloak chrome.exe not found under $root"
+          }
+          if ($c.Length -lt 1MB) { throw "chrome.exe 过小/损坏: $($c.FullName) size=$($c.Length)" }
+          echo "CHROME_EXE=$($c.FullName)" | Out-File -Append -Encoding ascii $env:GITHUB_ENV
+          # 注: chrome 是 GUI 程序, pwsh 不等待也不设 $LASTEXITCODE, 不能靠它冒烟;
+          # 可执行性由后续真实启动(Popen)验证, 早期版本即如此工作
+          Write-Host "cloak chrome OK: $($c.FullName) size=$($c.Length)"
+
+      - name: Cache CLIP model
+        id: clip-model
+        uses: actions/cache@v4
+        with:
+          path: clip-model
+          key: clip-model-vit-b-p32-v1
+
+      - name: Download CLIP model (first run only)
+        if: steps.clip-model.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: python -c "import clip_guess; clip_guess.ensure_model()"
+
+      - name: Register 10 accounts
+        shell: pwsh
+        env:
+          # 共存: 仓库 Secrets 优先, 否则用创建时传递的 inputs(两者留空则脚本跳过上传)
+          # 优先级: 仓库 Secret > 仓库 Variable > 手动触发输入
+          UPSTREAM_API: ${{ secrets.UPSTREAM_API || vars.UPSTREAM_API || inputs.upstream }}
+          UPSTREAM_TOKEN: ${{ secrets.UPSTREAM_TOKEN || vars.UPSTREAM_TOKEN || inputs.upstream_token }}
+        run: |
+          $pyargs = @('-u','batch_register.py','--count','${{ inputs.count }}','--workers','${{ inputs.workers }}','--out','accounts_${{ matrix.idx }}.jsonl')
+          if ('${{ inputs.key_mode }}' -eq 'skip') { $pyargs += '--no-key' }
+          python @pyargs
+
+      - name: Collect keys
+        if: always()
+        shell: pwsh
+        run: |
+          if (Test-Path key.txt) {
+            Copy-Item key.txt keys_job_${{ matrix.idx }}.txt -Force
+          } else {
+            New-Item -ItemType File keys_job_${{ matrix.idx }}.txt -Force | Out-Null
+          }
+          if (Test-Path accounts_${{ matrix.idx }}.jsonl) {
+            Copy-Item accounts_${{ matrix.idx }}.jsonl accounts_job_${{ matrix.idx }}.jsonl -Force
+          }
+
+      - name: Upload per-job artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: result-${{ matrix.idx }}
+          path: |
+            keys_job_${{ matrix.idx }}.txt
+            accounts_job_${{ matrix.idx }}.jsonl
+          if-no-files-found: ignore
+
+  merge:
+    name: Merge all keys
+    runs-on: windows-latest
+    needs: register
+    if: always()
+    timeout-minutes: 15
+    steps:
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          path: downloads
+          pattern: result-*
+          merge-multiple: true
+
+      - name: Merge keys & accounts
+        shell: pwsh
+        run: |
+          Get-ChildItem downloads -Filter "keys_job_*.txt" |
+            ForEach-Object { Get-Content $_.FullName } |
+            Where-Object { $_.Trim() -ne "" } |
+            Set-Content keys-all.txt -Encoding ascii
+          Get-ChildItem downloads -Filter "accounts_job_*.jsonl" |
+            ForEach-Object { Get-Content $_.FullName } |
+            Set-Content accounts-all.jsonl -Encoding utf8
+          echo "total keys: $((Get-Content keys-all.txt | Measure-Object -Line).Lines)"
+
+      - name: Upload merged keys
+        uses: actions/upload-artifact@v4
+        with:
+          name: keys-all
+          path: keys-all.txt
+
+      - name: Upload merged accounts
+        uses: actions/upload-artifact@v4
+        with:
+          name: accounts-all
+          path: accounts-all.jsonl
+
