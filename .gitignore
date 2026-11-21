@@ -1,0 +1,15 @@
+# 运行产物(勿提交)
+key*.txt
+accounts*.jsonl
+*.log
+# 模型与浏览器数据
+clip-model/
+ud_*/
+batch_ud_*/
+__pycache__/
+*.pyc
+
+# 运行时截图/切图中间产物
+captcha_cur.png
+regions_tmp.json
+keyfail_*.png
