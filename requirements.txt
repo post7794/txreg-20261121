@@ -1,0 +1,8 @@
+playwright
+requests
+pillow
+numpy
+transformers
+huggingface_hub
+safetensors
+cloakbrowser
